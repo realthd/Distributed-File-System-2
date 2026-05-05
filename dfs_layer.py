@@ -1,0 +1,214 @@
+import json
+from pathlib import Path
+
+from chord_layer import ChordRing, hash_key
+from paxos_layer import PaxosGroup, PaxosReplica
+
+PAGE_RECORDS = 25
+REPLICATION_FACTOR = 3
+
+class DFS:
+    def __init__(self, ring: ChordRing):
+        self.ring = ring
+        self.paxos_groups = {}
+
+    def _metadata_key(self, filename: str) -> str:
+        return f"meta:{filename}"
+
+    def _page_key(self, filename: str, page_no: int) -> str:
+        return f"page:{filename}:{page_no}"
+
+    def _replica_nodes(self, key: str):
+        return self.ring.successors(hash_key(key), REPLICATION_FACTOR)
+
+    def _write_replicated(self, key: str, value):
+        replica_nodes = self._replica_nodes(key)
+
+        for node in replica_nodes:
+            node.put(key, value)
+
+        return replica_nodes
+
+    def _read_replicated(self, key: str):
+        for node in self._replica_nodes(key):
+            value = node.get(key)
+            if value is not None:
+                return value
+
+        return None
+
+    def _delete_replicated(self, key: str):
+        for node in self._replica_nodes(key):
+            node.delete(key)
+
+    def _paxos_group(self, filename: str) -> PaxosGroup:
+        if filename not in self.paxos_groups:
+            metadata_key = self._metadata_key(filename)
+            replica_nodes = self._replica_nodes(metadata_key)
+
+            replicas = [
+                PaxosReplica(replica_id=f"node-{node.node_id}")
+                for node in replica_nodes
+            ]
+
+            self.paxos_groups[filename] = PaxosGroup(
+                replicas=replicas,
+                leader_id=replicas[0].replica_id
+            )
+
+        return self.paxos_groups[filename]
+
+    def touch(self, filename: str):
+        metadata = {
+            "filename": filename,
+            "size_bytes": 0,
+            "num_pages": 0,
+            "pages": [],
+            "version": 1
+        }
+
+        operation = {
+            "op": "create_metadata",
+            "filename": filename,
+            "version": metadata["version"]
+        }
+
+        if self._paxos_group(filename).propose(operation):
+            self._write_replicated(self._metadata_key(filename), metadata)
+
+        return metadata
+
+    def append_file(self, dfs_filename: str, local_path: str):
+        path = Path(local_path)
+        text = path.read_text(encoding="utf-8").strip()
+
+        records = []
+        for line in text.splitlines():
+            line = line.strip()
+            if line:
+                records.append(line)
+
+        metadata = self._read_replicated(self._metadata_key(dfs_filename))
+
+        if metadata is None:
+            metadata = self.touch(dfs_filename)
+
+        start_page = metadata["num_pages"]
+        new_pages = []
+
+        for offset in range(0, len(records), PAGE_RECORDS):
+            page_no = start_page + len(new_pages)
+            page_records = records[offset:offset + PAGE_RECORDS]
+            page_key = self._page_key(dfs_filename, page_no)
+
+            replica_nodes = self._write_replicated(page_key, "\n".join(page_records))
+
+            new_pages.append({
+                "page_no": page_no,
+                "guid": page_key,
+                "replicas": [f"node-{node.node_id}" for node in replica_nodes]
+            })
+
+        new_metadata = {
+            "filename": dfs_filename,
+            "size_bytes": metadata["size_bytes"] + len(text.encode("utf-8")),
+            "num_pages": metadata["num_pages"] + len(new_pages),
+            "pages": metadata["pages"] + new_pages,
+            "version": metadata["version"] + 1
+        }
+
+        operation = {
+            "op": "metadata_update_after_append",
+            "filename": dfs_filename,
+            "pages_added": len(new_pages),
+            "version": new_metadata["version"]
+        }
+
+        if self._paxos_group(dfs_filename).propose(operation):
+            self._write_replicated(self._metadata_key(dfs_filename), new_metadata)
+
+        return new_metadata
+
+    def read_file(self, dfs_filename: str) -> str:
+        metadata = self._read_replicated(self._metadata_key(dfs_filename))
+
+        if metadata is None:
+            raise FileNotFoundError(dfs_filename)
+
+        output = []
+
+        for page in sorted(metadata["pages"], key=lambda p: p["page_no"]):
+            page_data = self._read_replicated(page["guid"])
+
+            if page_data is not None:
+                output.append(page_data)
+
+        return "\n".join(output)
+
+    def sort_file(self, input_name: str, output_name: str):
+        records = self.read_file(input_name).splitlines()
+        records = [record.strip() for record in records if record.strip()]
+        records.sort()
+
+        temp_path = Path(f"{output_name}.tmp")
+        temp_path.write_text("\n".join(records), encoding="utf-8")
+
+        self.touch(output_name)
+        output_metadata = self.append_file(output_name, str(temp_path))
+        temp_path.unlink(missing_ok=True)
+
+        operation = {
+            "op": "metadata_update_after_sort_file",
+            "input": input_name,
+            "output": output_name,
+            "version": output_metadata["version"]
+        }
+
+        self._paxos_group(output_name).propose(operation, delayed=True)
+
+        return records
+
+    def delete_file(self, dfs_filename: str):
+        metadata = self._read_replicated(self._metadata_key(dfs_filename))
+
+        if metadata is None:
+            return False
+
+        operation = {
+            "op": "metadata_update_after_delete_file",
+            "filename": dfs_filename,
+            "version": metadata["version"] + 1
+        }
+
+        if self._paxos_group(dfs_filename).propose(operation):
+            for page in metadata["pages"]:
+                self._delete_replicated(page["guid"])
+
+            self._delete_replicated(self._metadata_key(dfs_filename))
+            return True
+
+        return False
+
+    def verify_sorted(self, dfs_filename: str) -> bool:
+        records = self.read_file(dfs_filename).splitlines()
+        records = [record.strip() for record in records if record.strip()]
+        return records == sorted(records)
+
+    def metadata_json(self, filename: str) -> str:
+        metadata = self._read_replicated(self._metadata_key(filename))
+        return json.dumps(metadata, indent=2)
+
+    def print_replica_locations(self, filename: str):
+        metadata_key = self._metadata_key(filename)
+        metadata_nodes = self._replica_nodes(metadata_key)
+
+        print(f"\nMetadata replicas for {filename}:")
+        for node in metadata_nodes:
+            print(f"  {metadata_key} -> node-{node.node_id} port={node.port}")
+
+        metadata = self._read_replicated(metadata_key)
+
+        if metadata:
+            print(f"\nPage replicas for {filename}:")
+            for page in metadata["pages"]:
+                print(f"  {page['guid']} -> {page['replicas']}")
