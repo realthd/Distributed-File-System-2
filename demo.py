@@ -44,9 +44,7 @@ def main():
 
     dfs = DFS(ring)
 
-    print("\n==============================")
-    print("DFS CREATE + APPEND DEMO")
-    print("==============================")
+    print("\nDFS CREATE + APPEND DEMO")
 
     dfs.touch("music.csv")
     dfs.append_file("music.csv", "samples/a.txt")
@@ -61,9 +59,7 @@ def main():
     print("\nRead back from DFS:")
     print(dfs.read_file("music.csv"))
 
-    print("\n==============================")
-    print("SORTING DEMO: 130 RECORDS")
-    print("==============================")
+    print("\nSORTING DEMO: 130 RECORDS")
 
     dfs.touch("big.csv")
     dfs.append_file("big.csv", "samples/unsorted_130.txt")
@@ -86,9 +82,7 @@ def main():
     for record in sorted_records[-10:]:
         print(record)
 
-    print("\n==============================")
-    print("FAILURE DEMO")
-    print("==============================")
+    print("\nFAILURE DEMO")
 
     group = dfs._paxos_group("music.csv")
     crashed_replica = group.replicas[-1].replica_id
@@ -102,9 +96,7 @@ def main():
         simulate_crash=crashed_replica
     )
 
-    print("\n==============================")
-    print("DELETE FILE DEMO")
-    print("==============================")
+    print("\nDELETE FILE DEMO")
 
     deleted = dfs.delete_file("music.csv")
     print("Deleted music.csv:", deleted)
